@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include "list.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -17,24 +18,60 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 
+
 #define MAX_SIMULTANEOUS_CONNECTION 300
 
 #define CLIENT 0
 #define NODE   1
 
-#define SCHED_RANDOM 0
-#define SCHED_RR     1
+#define SCHED_RANDOM 1
+#define SCHED_RR     2
 
 struct connection_context {
   int fd;
   int type;
-  //TODO: CREATE HERE ALL WHAT I NEED!!!
+
+  struct list_head client_queue;
 };
 
 struct dispatcher {
+  int pos;
   int size;
   struct connection_context **queue;
 };
+
+static void
+call_client(struct connection_context *dctx, const char *buffer, ssize_t bufflen)
+{
+  struct connection_context *ctx, *tmp;
+  list_for_each_entry_safe(ctx, tmp, &dctx->client_queue, client_queue) {
+    send(ctx->fd, buffer, bufflen, 0); 
+    list_del_init(&ctx->client_queue);
+    break;
+  }  
+}
+
+static void
+call_dispatcher(int scheduler_method, struct connection_context *ctx, struct dispatcher *d, const char *buffer, ssize_t bufflen)
+{
+  srand(time(0));
+
+  if (!d->size)
+    send(ctx->fd, "Not possible to process", strlen("Not possible to process"), 0);
+  else if (scheduler_method == SCHED_RR) {
+    struct connection_context *dctx = d->queue[d->pos];
+    ++d->pos;
+    if (d->pos == d->size) d->pos = 0;
+    send(dctx->fd, buffer, bufflen, 0);
+    list_add_tail(&ctx->client_queue, &dctx->client_queue);
+  }
+  else {
+    int pos = (rand() % d->size);
+    struct connection_context *dctx = d->queue[pos];
+    send(dctx->fd, buffer, bufflen, 0);
+    list_add_tail(&ctx->client_queue, &dctx->client_queue);
+  }
+}
 
 static struct connection_context *
 register_client(int fd)
@@ -44,6 +81,7 @@ register_client(int fd)
   ctx->fd   = fd;
   ctx->type = CLIENT;
 
+  INIT_LIST_HEAD(&ctx->client_queue);
   return ctx;
 }
 
@@ -59,6 +97,8 @@ register_node(int fd, struct dispatcher *d) {
   d->queue = realloc(d->queue, sizeof(struct connection_context *) * d->size);
   d->queue[d->size - 1] = ctx;
 
+  INIT_LIST_HEAD(&ctx->client_queue);
+
   return ctx;
 }
 
@@ -73,16 +113,19 @@ unregister_node(int fd, struct dispatcher *d) {
   }
 
   while (size - 1) {
-    curr = curr + 1;
+    *curr = *(curr + 1);
     ++curr;
     --size;
   }
 
+
   --d->size;
+  if (d->pos == d->size)
+    d->pos = 0;
 }
 
 static int
-start_proxy(uint16_t port_client, uint16_t port_node, uint16_t num_of_nodes, int scheduler_method)
+start_proxy(uint16_t port_client, uint16_t port_node, uint16_t num_of_nodes, uint8_t scheduler_method)
 {
   int efd, tcp4fd, tcp6fd, tcp_node4fd, tcp_node6fd;
 
@@ -222,37 +265,18 @@ start_proxy(uint16_t port_client, uint16_t port_node, uint16_t num_of_nodes, int
           if (ctx->type == NODE)
             unregister_node(ctx->fd, &d);
 
+          list_del_init(&ctx->client_queue);
           free(ctx);
           continue;
         }
 
-/*
-          while ((bytesRecv = recv(events[i].data.fd, header, sizeof(header), MSG_PEEK)) != -1)
-            {
-              if (bytesRecv == sizeof(header))
-              {
-                if (ntohl(header[0]) == MAGIC_NUMBER)
-                {
-                  size_t pktSize = (ntohl(header[5]) + sizeof(header));
-                  char *buffer = new char[pktSize];
-                  if ((bytesRecv = recv(events[i].data.fd, buffer, pktSize, MSG_WAITALL)) != -1)
-                  {
-                    if (bytesRecv == (ssize_t) pktSize)
-                    {
-                      QByteArray ba(buffer, bytesRecv);
-                      dataReceived(tcpAddressMap[events[i].data.fd], ba);
-                    } // end if
-                  } // end if
+        char buffer[8000];
+        ssize_t bytes_recv = recv(ctx->fd, buffer, 8000, 0);
 
-                  delete [] buffer;
-                } // end if
-                else
-                {
-                  recv(events[i].data.fd, header, sizeof(quint32), 0);
-                } // end else
-              } // end if
-            } // end while
-*/
+        if (ctx->type == CLIENT)
+          call_dispatcher(scheduler_method, ctx, &d, buffer, bytes_recv);
+        else
+          call_client(ctx, buffer, bytes_recv);
       }
     }
   }
@@ -268,7 +292,9 @@ print_usage(const char * const app_name)
     "Options:\n"
     "\t-n --node-number=<number>\n"
     "\t-c --port-client=<port>\n"
-    "\t-s --port-node=<port>\n",
+    "\t-s --port-node=<port>\n"
+    "\t-R --sched-rr\n"
+    "\t-r --sched-random\n",
     app_name
   );
 }
@@ -276,19 +302,22 @@ print_usage(const char * const app_name)
 int
 main(int argc, char **argv)
 {
+  uint8_t  type        = 0;
   uint16_t port_client = 0;
   uint16_t port_node   = 0;
   uint16_t number      = 0;
 
   struct option opts[] = {
-    { "port-client", 1, 0, 'c' },
-    { "port-node"  , 1, 0, 's' },
-    { "node-number", 1, 0, 'n' },
-    { NULL         , 0, 0, 0   }
+    { "port-client" , 1, 0, 'c' },
+    { "port-node"   , 1, 0, 's' },
+    { "node-number" , 1, 0, 'n' },
+    { "sched-rr"    , 1, 0, 'R' },
+    { "sched-random", 1, 0, 'r' },
+    { NULL          , 0, 0, 0   }
   };
 
   int opt;
-  while ((opt = getopt_long(argc, argv, "s:c:n:", opts, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "s:c:n:rR", opts, NULL)) != -1) {
     switch(opt) {
       case 'c':
         port_client = atoi(optarg);
@@ -299,17 +328,22 @@ main(int argc, char **argv)
       case 'n':
         number = atoi(optarg);
       break;
+      case 'r':
+        type |= SCHED_RANDOM;
+      break;
+      case 'R':
+        type |= SCHED_RR;
+      break;
       default:
         print_usage(argv[0]);
         return 1;
     }
   }
 
-  if (!port_client || !port_node || !number) {
+  if (!port_client || !port_node || !number || type == 0 || type > 2) {
     print_usage(argv[0]);
     return 1;
   }
 
-  //TODO: PASS IT AS PARAMETER!!!
-  return start_proxy(port_client, port_node, number, SCHED_RR);
+  return start_proxy(port_client, port_node, number, type);
 }

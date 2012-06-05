@@ -58,10 +58,23 @@ start_node(const char * const proxy_address, uint16_t port)
     return 1;
   }
 
-  //TODO: WHILE!!!
+  char buffer[8000];
+  while (true) {
+    size_t len;
+    if ((len = recv(fd, buffer, 8000, 0)) == 0)
+      break;
+
+    buffer[len] = 0;
+    printf("RECEIVED: %s\n", buffer);
+    send(fd, "CALL BACK CLIENT", strlen("CALL BACK CLIENT"), 0);
+  }
 
   if (res)
     freeaddrinfo(res); 
+
+  close(fd);
+
+  return 0;
 }
 
 static void

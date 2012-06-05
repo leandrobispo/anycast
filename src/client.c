@@ -1,181 +1,147 @@
-#include <unistd.h>
-
 #include <stdio.h>
-#include <stdlib.h>
+#include <stdint.h>
 #include <stdbool.h>
 
-#include <dirent.h>
+#include <malloc.h>
 
-#include <errno.h>
-#include <fcntl.h>
+#include <getopt.h>
 #include <string.h>
 
-#include <linux/if_ether.h>
-#include <arpa/inet.h>
-
-#include <sys/time.h>
-#include <sys/stat.h>
-#include <sys/param.h>
-#include <sys/epoll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/syscall.h>
-#include <sys/resource.h>
 
+#include <arpa/inet.h>
 #include <netinet/in.h>
+
+#include <signal.h>
+#include <errno.h>
+#include <fcntl.h>
+
 #include <netdb.h>
 
-#include <string.h>
+#define BUFF_SIZE 8000
 
-#define MAX_EVENTS 2
-#define BUFF_MAX BUFSIZ + 1
-
-static bool
-setnonblocking(int fd)
+static int
+start_client(const char * const proxy_address, uint16_t port)
 {
-  int opts;
-  if ((opts = fcntl(fd, F_GETFL)) == -1)
-    return false;
+  int fd;
+  struct in6_addr srv; 
+  struct addrinfo hints, *res = NULL;
 
-  opts = opts | O_NONBLOCK;
-  if (fcntl(fd, F_SETFL, opts) == -1)
-    return false;
+  memset(&hints, 0x00, sizeof(hints));
+  hints.ai_flags    = AI_NUMERICSERV;
+  hints.ai_family   = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
 
-  return true;
+  if (inet_pton(AF_INET, proxy_address, &srv) == 1) {
+    hints.ai_family = AF_INET;
+    hints.ai_flags |= AI_NUMERICHOST;
+  }
+  else if (inet_pton(AF_INET6, proxy_address, &srv) == 1) {
+    hints.ai_family = AF_INET6;
+    hints.ai_flags |= AI_NUMERICHOST;
+  }
+
+  char srv_port[5];
+  sprintf(srv_port, "%u", port);
+
+  if (getaddrinfo(proxy_address, srv_port, &hints, &res) != 0) {
+    //TODO: Handle the error!
+    return 1;
+  }
+
+  if ((fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) == -1) {
+    //TODO: Handle the error!
+    return 1;
+  }
+
+  if (connect(fd, res->ai_addr, res->ai_addrlen) == -1) {
+    //TODO: Handle the error!
+    return 1;
+  }
+
+  char console[BUFF_SIZE];
+  char buffer[BUFF_SIZE];
+  memset(console, 0, BUFF_SIZE);
+
+  int len;
+  while (true) {
+    fprintf(stdout, "> ");
+    fgets(console, BUFF_SIZE - 1, stdin);
+
+    len = strlen(console);
+    if (console[len - 1] == '\n')
+      console[len - 1] = 0;
+
+    if (strcmp(console, "quit") == 0)
+      break;
+
+    if (send(fd, console, strlen(console), 0) == -1)
+      break;
+
+    if ((len = recv(fd, buffer, BUFF_SIZE, 0)) == 0)
+      break;
+
+    buffer[len] = 0;
+    printf("%s\n", buffer);
+    fflush(stdin);
+  }
+
+  if (res)
+    freeaddrinfo(res); 
+
+  close(fd);
+
+  return 0;
 }
 
-
 static void
-send_request(int sock_fd, char * buffer)
+print_usage(const char * const app_name)
 {
-	ssize_t recv_bytes;
-	char recv_buffer[BUFF_MAX];
-
-	if (send(sock_fd, buffer, strlen(buffer), 0) != strlen(buffer)) {
-		printf("Could not send message.\n");
-	}
-
-	send(sock_fd, (char *) 13, 1, 0);
-
-	recv_bytes = recv(sock_fd, recv_buffer, BUFF_MAX, 0);
-	recv_buffer[recv_bytes] = 0;
-
-	printf("%s\n> ", recv_buffer);	
-	fflush(stdout);
-
+  fprintf(stderr, "Usage: %s [options]\n"
+    "Calculator client Implementation\n"
+    "Options:\n"
+    "\t-P --proxy=<proxy>\n"
+    "\t-p --proxy-port=<port>\n",
+    app_name
+  );
 }
 
-static void
-process_command (int sock_fd, char * buffer)
+int
+main(int argc, char **argv)
 {
-	
-	if (strncasecmp("help", buffer, strlen("help")) == 0) {
-	    printf("\nManual da Calculadora\nOprerações: + , - , x , /\nUso: operação <operando 1> <operando 2>\nPara sair: quit\n\n> ");
-		return;
-	} 
-	else if (strncasecmp("quit", buffer, strlen("quit")) == 0) {
-		close(sock_fd);
-		exit(0);
-	} 
-	else {
-		send_request(sock_fd, buffer);
-	}
+  uint16_t port   = 0;
+  char     *proxy = NULL;
 
-}	
+  struct option opts[] = {
+    { "port"      , 1, 0, 'p' },
+    { "proxy-port", 1, 0, 'P' },
+    { NULL        , 0, 0, 0   }
+  };
 
-int 
-main (int argc, char **argv)
-{
-	struct sockaddr_in srv;
-	struct hostent *registerDNS;
-	char buffer[BUFF_MAX];
-	char *hostName;
-	char *data;
+  int opt;
+  while ((opt = getopt_long(argc, argv, "p:P:", opts, NULL)) != -1) {
+    switch(opt) {
+      case 'p':
+        port = atoi(optarg);
+      break;
+      case 'P':
+        proxy = strdup(optarg);
+      break;
+      default:
+        print_usage(argv[0]);
+        return 1;
+    }
+  }
 
-	int efd, sock_fd, nfds;
-	struct epoll_event in_event, events[MAX_EVENTS];
+  if (!port || !proxy) {
+    print_usage(argv[0]);
+    return 1;
+  }
 
-	if (argc != 3) {
-		printf("Usage: client <host> <port>\n");
-		exit(1);
-	}
+  int ret = start_client(proxy, port);
+ 
+  free(proxy); 
 
-	hostName = argv[1];
-
-	if ((registerDNS = gethostbyname(hostName)) == NULL) {
-		printf("Could not get IP address. May not continue.\n");
-		exit(1);
-	}
-
-	bcopy((char *) registerDNS->h_addr, (char *) &srv.sin_addr, registerDNS->h_length);
-
-	srv.sin_port = htons(atoi(argv[2]));
-	srv.sin_family = AF_INET;
-
-	if ((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-		printf("Could not initialize SOCKET.\n");
-		exit(1);
-	}
-
-	if (!setnonblocking(STDIN_FILENO)) {
-		printf("Problems to initialize STDIN.\n");
-		exit(1);
-	}
-
-	if ((connect(sock_fd, (struct sockaddr *) &srv, sizeof(srv)) < 0)) {
-		printf("Could not connect to the server.\n");
-		exit(1);
-	}	
-
-	memset(&in_event, 0, sizeof(struct epoll_event));
-
-	in_event.data.fd = STDIN_FILENO;
-	in_event.events = EPOLLIN | EPOLLET;
-
-#ifdef EPOLLRDHUP
-	if ((efd = epoll_create1(0)) == -1) {
-#else
-	if ((efd = epoll_create(MAX_EVENTS)) == -1) {
-#endif
-		printf("Could not initialize EPOLL.\n");
-		exit(1);
-	}
-
-	if (epoll_ctl(efd, EPOLL_CTL_ADD, STDIN_FILENO, &in_event) == -1) {
-		printf("Could not initialize EPOLL.\n");
-		exit(1);
-	}
-
-	printf("> ");
-	fflush(stdout);
-
-	for (;;) {
-		if ((nfds = epoll_wait(efd, events, MAX_EVENTS, 200)) == -1) {
-			if (errno == EINTR || errno == EAGAIN)
-				continue;
-			else {
-				printf("Internal error. Application may not continue.\n");
-				exit(1);
-			}
-
-		}
-
-		int i;
-		for (i = 0; i < nfds; i++) {
-			if (events[i].data.fd == STDIN_FILENO && events[i].events) {
-				int j = 0;
-				char c;
-				while (read(STDIN_FILENO, &c, 1) != -1) {
-					if (j < BUFF_MAX -1 && c != '\n') {
-						buffer[j++] = c;
-					}
-				}
-
-				fflush(stdin);
-				buffer[j] = 0;
-
-				process_command (sock_fd, buffer);
-			}
-		}
-	}
-}	
+  return ret;
+}
