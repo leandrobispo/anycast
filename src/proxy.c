@@ -7,12 +7,254 @@
 #include <getopt.h>
 #include <string.h>
 
-static int
-start_proxy(uint16_t port, uint16_t num_of_nodes)
+#include <arpa/inet.h>
+
+#include <signal.h>
+#include <errno.h>
+#include <fcntl.h>
+
+#include <sys/types.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+
+#define MAX_SIMULTANEOUS_CONNECTION 300
+
+#define CLIENT 0
+#define NODE   1
+
+#define SCHED_RANDOM 0
+#define SCHED_RR     1
+
+struct connection_context {
+  int fd;
+  int type;
+  //TODO: CREATE HERE ALL WHAT I NEED!!!
+};
+
+struct dispatcher {
+  int size;
+  struct connection_context **queue;
+};
+
+static struct connection_context *
+register_client(int fd)
 {
+  struct connection_context *ctx = malloc(sizeof(struct connection_context));
+
+  ctx->fd   = fd;
+  ctx->type = CLIENT;
+
+  return ctx;
+}
+
+static struct connection_context *
+register_node(int fd, struct dispatcher *d) {
+  struct connection_context *ctx = malloc(sizeof(struct connection_context));
+
+  ctx->fd   = fd;
+  ctx->type = NODE;
+
+  ++(d->size);
+
+  d->queue = realloc(d->queue, sizeof(struct connection_context *) * d->size);
+  d->queue[d->size - 1] = ctx;
+
+  return ctx;
+}
+
+static void
+unregister_node(int fd, struct dispatcher *d) {
+  struct connection_context **curr = d->queue;
+
+  int size = d->size;
+  while ((*curr)->fd != fd) {
+    --size;
+    ++curr;
+  }
+
+  while (size - 1) {
+    curr = curr + 1;
+    ++curr;
+    --size;
+  }
+
+  --d->size;
+}
+
+static int
+start_proxy(uint16_t port_client, uint16_t port_node, uint16_t num_of_nodes, int scheduler_method)
+{
+  int efd, tcp4fd, tcp6fd, tcp_node4fd, tcp_node6fd;
+
+  struct sockaddr_in  srv4, srv_node4, cli4;
+  struct sockaddr_in6 srv6, srv_node6, cli6;
+
+  socklen_t client_len4 = sizeof(srv4);
+  socklen_t client_len6 = sizeof(srv6);
+
+  uint16_t max_conn = (MAX_SIMULTANEOUS_CONNECTION * 2) + (num_of_nodes * 2);
+
+#ifdef EPOLLRDHUP
+  if ((efd = epoll_create1(0)) == -1) {
+#else
+  if ((efd = epoll_create(max_conn + 5)) == -1) {
+#endif
+    fprintf(stderr, "Problems to start an epoll file descriptor\n");
+    return 1;
+  }
+
+  struct dispatcher d;
+  memset(&d, 0, sizeof(d));
+
+  memset(&srv4     , 0, sizeof(srv4));
+  memset(&srv_node4, 0, sizeof(srv_node4));
+  memset(&srv6     , 0, sizeof(srv6));
+  memset(&srv_node6, 0, sizeof(srv_node6));
+
+  srv4.sin_family      = AF_INET;
+  srv4.sin_port        = htons(port_client);
+  srv4.sin_addr.s_addr = INADDR_ANY;
+
+  srv6.sin6_family = AF_INET6;
+  srv6.sin6_port   = htons(port_client);
+  srv6.sin6_addr   = in6addr_any;
+
+  srv_node4.sin_family      = AF_INET;
+  srv_node4.sin_port        = htons(port_node);
+  srv_node4.sin_addr.s_addr = INADDR_ANY;
+
+  srv_node6.sin6_family = AF_INET6;
+  srv_node6.sin6_port   = htons(port_node);
+  srv_node6.sin6_addr   = in6addr_any;
+
+  struct epoll_event tcpev, events[max_conn + 5];
+  if ((tcp4fd = init_socket(efd, AF_INET, (struct sockaddr *) &srv4, client_len4, MAX_SIMULTANEOUS_CONNECTION)) == -1) {
+    fprintf(stderr, "Cannot initialize the IN4\n");
+    //TODO: HANDLE THE ERROR
+    return 1;
+  }
+
+  if ((tcp_node4fd = init_socket(efd, AF_INET, (struct sockaddr *) &srv_node4, client_len4, num_of_nodes)) == -1) {
+    fprintf(stderr, "Cannot initialize the OUT4\n");
+    //TODO: HANDLE THE ERROR
+    return 1;
+  }
+
+  if ((tcp6fd = init_socket(efd, AF_INET6, (struct sockaddr *) &srv6, client_len6, MAX_SIMULTANEOUS_CONNECTION)) == -1) {
+    fprintf(stderr, "Cannot initialize the OUT6\n");
+    //TODO: HANDLE THE ERROR
+    return 1;
+  }
+
+  if ((tcp_node6fd = init_socket(efd, AF_INET6, (struct sockaddr *) &srv_node6, client_len6, num_of_nodes)) == -1) {
+    fprintf(stderr, "Cannot initialize the IN6\n");
+    //TODO: HANDLE THE ERROR
+    return 1;
+  }
+
+  int nfds;
   for (;;) {
-  
-    //TODO: IMPLEMENT ME!!
+    if ((nfds = epoll_wait(efd, events, max_conn + 5, -1)) == -1) {
+      if (errno == EINTR || errno == EAGAIN)
+        continue;
+      else {
+        //TODO: HANDLE THE ERROR
+        return 1;
+      }
+    }
+
+    int i;
+    for (i = 0; i < nfds; ++i) {
+      if ((events[i].data.fd == tcp4fd || events[i].data.fd == tcp_node4fd) && events[i].events) {
+        int new_fd;
+        while ((new_fd = accept(events[i].data.fd, (struct sockaddr *) &cli4, &client_len4)) != -1) {
+          setnonblocking(new_fd);
+          if (events[i].data.fd == tcp4fd)
+            tcpev.data.ptr = (void *) register_client(new_fd);
+          else
+            tcpev.data.ptr = (void *) register_node(new_fd, &d);
+
+#ifdef EPOLLRDHUP
+          tcpev.events  = EPOLLIN | EPOLLET | EPOLLRDHUP;
+#else
+          tcpev.events  = EPOLLIN | EPOLLET | EPOLLHUP;
+#endif
+
+          if (epoll_ctl(efd, EPOLL_CTL_ADD, new_fd, &tcpev) == -1) {
+            fprintf(stderr, "Problems to add the new TCP connection to the poll: %s\n", strerror(errno));
+            close(new_fd);
+            continue;
+          }
+        }
+      }
+      else if ((events[i].data.fd == tcp6fd || events[i].data.fd == tcp_node6fd) && events[i].events) {
+        int new_fd;
+        while ((new_fd = accept(events[i].data.fd, (struct sockaddr *) &cli6, &client_len6)) != -1) {
+          setnonblocking(new_fd);
+          if (events[i].data.fd == tcp6fd)
+            tcpev.data.ptr = (void *) register_client(new_fd);
+          else
+            tcpev.data.ptr = (void *) register_node(new_fd, &d);
+
+#ifdef EPOLLRDHUP
+          tcpev.events  = EPOLLIN | EPOLLET | EPOLLRDHUP;
+#else
+          tcpev.events  = EPOLLIN | EPOLLET | EPOLLHUP;
+#endif
+
+          if (epoll_ctl(efd, EPOLL_CTL_ADD, new_fd, &tcpev) == -1) {
+            fprintf(stderr, "Problems to add the new TCP connection to the poll: %s\n", strerror(errno));
+            close(new_fd);
+            continue;
+          }
+        }
+      }
+      else
+      {
+        struct connection_context *ctx = (struct connection_context *) events[i].data.ptr;
+#ifdef EPOLLRDHUP
+        if (events[i].events & EPOLLRDHUP) {
+#else
+        if (events[i].events & EPOLLHUP) {
+#endif
+          epoll_ctl(efd, EPOLL_CTL_DEL, ctx->fd, NULL);
+          close(ctx->fd);
+          if (ctx->type == NODE)
+            unregister_node(ctx->fd, &d);
+
+          free(ctx);
+          continue;
+        }
+
+/*
+          while ((bytesRecv = recv(events[i].data.fd, header, sizeof(header), MSG_PEEK)) != -1)
+            {
+              if (bytesRecv == sizeof(header))
+              {
+                if (ntohl(header[0]) == MAGIC_NUMBER)
+                {
+                  size_t pktSize = (ntohl(header[5]) + sizeof(header));
+                  char *buffer = new char[pktSize];
+                  if ((bytesRecv = recv(events[i].data.fd, buffer, pktSize, MSG_WAITALL)) != -1)
+                  {
+                    if (bytesRecv == (ssize_t) pktSize)
+                    {
+                      QByteArray ba(buffer, bytesRecv);
+                      dataReceived(tcpAddressMap[events[i].data.fd], ba);
+                    } // end if
+                  } // end if
+
+                  delete [] buffer;
+                } // end if
+                else
+                {
+                  recv(events[i].data.fd, header, sizeof(quint32), 0);
+                } // end else
+              } // end if
+            } // end while
+*/
+      }
+    }
   }
 
   return 0;
@@ -25,7 +267,8 @@ print_usage(const char * const app_name)
     "Calculator proxy Implementation\n"
     "Options:\n"
     "\t-n --node-number=<number>\n"
-    "\t-p --port=<port>\n",
+    "\t-c --port-client=<port>\n"
+    "\t-s --port-node=<port>\n",
     app_name
   );
 }
@@ -33,20 +276,25 @@ print_usage(const char * const app_name)
 int
 main(int argc, char **argv)
 {
-  uint16_t port   = 0;
-  uint16_t number = NULL;
+  uint16_t port_client = 0;
+  uint16_t port_node   = 0;
+  uint16_t number      = 0;
 
   struct option opts[] = {
-    { "port"       , 1, 0, 'p' },
+    { "port-client", 1, 0, 'c' },
+    { "port-node"  , 1, 0, 's' },
     { "node-number", 1, 0, 'n' },
     { NULL         , 0, 0, 0   }
   };
 
   int opt;
-  while ((opt = getopt_long(argc, argv, "p:n:", opts, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "s:c:n:", opts, NULL)) != -1) {
     switch(opt) {
-      case 'p':
-        port = atoi(optarg);
+      case 'c':
+        port_client = atoi(optarg);
+      break;
+      case 's':
+        port_node = atoi(optarg);
       break;
       case 'n':
         number = atoi(optarg);
@@ -57,12 +305,11 @@ main(int argc, char **argv)
     }
   }
 
-  if (!port || !number) {
+  if (!port_client || !port_node || !number) {
     print_usage(argv[0]);
     return 1;
   }
 
-  int ret = start_proxy(port, number);
-
-  return ret;
+  //TODO: PASS IT AS PARAMETER!!!
+  return start_proxy(port_client, port_node, number, SCHED_RR);
 }

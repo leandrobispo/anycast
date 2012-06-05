@@ -7,30 +7,61 @@
 #include <getopt.h>
 #include <string.h>
 
-#define IPV4 1
-#define IPV6 2
+#include <sys/types.h>
+#include <sys/socket.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
+#include <signal.h>
+#include <errno.h>
+#include <fcntl.h>
+
+#include <netdb.h>
 
 static int
-register_in_proxy(const char * const server_address, uint16_t port)
+start_node(const char * const proxy_address, uint16_t port)
 {
-  int fd = 0;
-  return fd;
-}
+  int fd;
+  struct in6_addr srv; 
+  struct addrinfo hints, *res = NULL;
 
-static int
-start_node(int type, const char * const proxy_address, uint16_t port)
-{
-  if (type == IPV4) {
+  memset(&hints, 0x00, sizeof(hints));
+  hints.ai_flags    = AI_NUMERICSERV;
+  hints.ai_family   = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+
+  if (inet_pton(AF_INET, proxy_address, &srv) == 1) {
+    hints.ai_family = AF_INET;
+    hints.ai_flags |= AI_NUMERICHOST;
   }
-  else if (type == IPV6) {
+  else if (inet_pton(AF_INET6, proxy_address, &srv) == 1) {
+    hints.ai_family = AF_INET6;
+    hints.ai_flags |= AI_NUMERICHOST;
   }
 
-  for (;;) {
-  
-    //TODO: IMPLEMENT ME!!
+  char srv_port[5];
+  sprintf(srv_port, "%u", port);
+
+  if (getaddrinfo(proxy_address, srv_port, &hints, &res) != 0) {
+    //TODO: Handle the error!
+    return 1;
   }
 
-  return 0;
+  if ((fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol)) == -1) {
+    //TODO: Handle the error!
+    return 1;
+  }
+
+  if (connect(fd, res->ai_addr, res->ai_addrlen) == -1) {
+    //TODO: Handle the error!
+    return 1;
+  }
+
+  //TODO: WHILE!!!
+
+  if (res)
+    freeaddrinfo(res); 
 }
 
 static void
@@ -40,8 +71,6 @@ print_usage(const char * const app_name)
     "Calculator Node Implementation\n"
     "Options:\n"
     "\t-P --proxy=<proxy>\n"
-    "\t-f --ivp4\n"
-    "\t-s --ivp6\n"
     "\t-p --proxy-port=<port>\n",
     app_name
   );
@@ -53,25 +82,15 @@ main(int argc, char **argv)
   uint16_t port   = 0;
   char     *proxy = NULL;
 
-  int type = 0;
-
   struct option opts[] = {
     { "port"      , 1, 0, 'p' },
     { "proxy-port", 1, 0, 'P' },
-    { "ipv4"      , 1, 0, 'f' },
-    { "ipv6"      , 1, 0, 's' },
     { NULL        , 0, 0, 0   }
   };
 
   int opt;
-  while ((opt = getopt_long(argc, argv, "p:P:fs", opts, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "p:P:", opts, NULL)) != -1) {
     switch(opt) {
-      case 'f':
-        type |= IPV4;
-      break;
-      case 's':
-        type |= IPV6;
-      break;
       case 'p':
         port = atoi(optarg);
       break;
@@ -84,12 +103,12 @@ main(int argc, char **argv)
     }
   }
 
-  if (!port || !proxy || type == 0 || type == 3) {
+  if (!port || !proxy) {
     print_usage(argv[0]);
     return 1;
   }
 
-  int ret = start_node(type, proxy, port);
+  int ret = start_node(proxy, port);
  
   free(proxy); 
 
